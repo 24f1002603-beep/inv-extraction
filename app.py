@@ -7,12 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
+# Direct integration with AI Pipe using your single environment variable token
 client = OpenAI(
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url=os.environ.get(
-        "OPENROUTER_BASE_URL",
-        "https://openrouter.ai/api/v1"
-    )
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openrouter/v1"
 )
 
 app = FastAPI(title="Invoice Intelligence API")
@@ -50,60 +48,48 @@ def extract_invoice(req: InvoiceRequest):
     if email_match:
         fallback_email = email_match.group(0).strip().lower()
 
-    # Pre-scan for common currencies in the text as a backup
     fallback_currency = None
     text_upper = req.text.upper()
-    if "EUR" in text_upper or "EURO" in text_upper or "€" in text_upper:
+    if any(x in text_upper for x in ["EUR", "EURO", "€"]): 
         fallback_currency = "EUR"
-    elif "USD" in text_upper or "DOLLAR" in text_upper or "$" in text_upper:
+    elif any(x in text_upper for x in ["USD", "DOLLAR", "$"]): 
         fallback_currency = "USD"
-    elif "GBP" in text_upper or "POUND" in text_upper or "£" in text_upper:
+    elif any(x in text_upper for x in ["GBP", "POUND", "£"]): 
         fallback_currency = "GBP"
-    elif "INR" in text_upper or "RUPEE" in text_upper or "₹" in text_upper:
+    elif any(x in text_upper for x in ["INR", "RUPEE", "₹"]): 
         fallback_currency = "INR"
-    elif "JPY" in text_upper or "YEN" in text_upper or "¥" in text_upper:
+    elif any(x in text_upper for x in ["JPY", "YEN", "¥"]): 
         fallback_currency = "JPY"
 
-    prompt = f"""
-Extract the invoice into JSON.
-
-Return ONLY valid JSON matching the supplied schema. Do not use markdown wrappers like ```json.
-
-Rules:
-- vendor exactly as written (remove trailing punctuation only)
-- currency must be ISO4217 code (USD, EUR, GBP, INR, JPY)
-- total_amount integer
-- invoice_date YYYY-MM-DD
-- due_in_days integer
-- is_paid boolean
-- priority one of low, normal, high, urgent
-- contact_email must be extracted in lowercase
-- preserve line_items order
-- unit_price integer
-- item_count = len(line_items)
-
-Schema:
-{json.dumps(req.schema)}
-
-Invoice:
-{req.text}
-"""
-
+    # 2. CALL THE LLM WITH STRICT JSON SCHEMA ENFORCEMENT
     try:
-        # Switching to a production-grade model (Gemini 2.5 Flash) for highly accurate schema following
         response = client.chat.completions.create(
             model="google/gemini-2.5-flash",
             temperature=0,
             max_tokens=1500, 
-            response_format={"type": "json_object"},
+            # Submitting the dynamic schema via strict format handling 
+            # prevents the model from dropping fields or leaving them as null.
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "InvoiceExtractionSchema",
+                    "strict": True,
+                    "schema": req.schema
+                }
+            },
             messages=[
                 {
                     "role": "system",
-                    "content": "Return ONLY valid JSON matching the supplied schema. Never include markdown wrappers, explanations, or extra text."
+                    "content": (
+                        "You are a precise data extraction engine. You must strictly match the types "
+                        "requested in the schema. Convert text descriptions of time periods or values "
+                        "into clean integers (e.g., 'within a week' -> 7, 'in two weeks' -> 14, "
+                        "'Net 30' -> 30, 'twelve thousand' -> 12000)."
+                    )
                 },
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": f"Extract the matching fields from this invoice document text:\n\n{req.text}"
                 }
             ],
         )
@@ -115,9 +101,7 @@ Invoice:
         print(f"Extraction processing failed: {e}")
         data = {}
 
-    # ---------------- Normalize & Force Corrections ----------------
-
-    # Apply backup safety net fields if the AI missed them or crashed
+    # 3. NORMALIZE & FORCE CORRECTIONS
     if not data.get("contact_email") and fallback_email:
         data["contact_email"] = fallback_email
 
@@ -140,40 +124,31 @@ Invoice:
     if isinstance(data.get("priority"), str):
         data["priority"] = data["priority"].strip().lower()
 
-    if data.get("total_amount") is not None:
-        try:
-            data["total_amount"] = int(float(data["total_amount"]))
-        except Exception:
-            pass
-
-    if data.get("due_in_days") is not None:
-        try:
-            data["due_in_days"] = int(float(data["due_in_days"]))
-        except Exception:
-            pass
+    # Verify key numeric metrics are explicitly converted to base integers
+    for int_field in ["total_amount", "due_in_days"]:
+        if data.get(int_field) is not None:
+            try:
+                data[int_field] = int(float(data[int_field]))
+            except Exception:
+                pass
 
     if isinstance(data.get("line_items"), list):
         for item in data["line_items"]:
             if not isinstance(item, dict):
                 continue
 
-            if item.get("quantity") is not None:
-                try:
-                    item["quantity"] = int(float(item["quantity"]))
-                except Exception:
-                    pass
-
-            if item.get("unit_price") is not None:
-                try:
-                    item["unit_price"] = int(float(item["unit_price"]))
-                except Exception:
-                    pass
+            for nested_int in ["quantity", "unit_price"]:
+                if item.get(nested_int) is not None:
+                    try:
+                        item[nested_int] = int(float(item[nested_int]))
+                    except Exception:
+                        pass
 
         data["item_count"] = len(data["line_items"])
     else:
         data["item_count"] = 0
 
-    # -------- Return EXACTLY schema keys --------
+    # 4. RETURN EXACTLY SCHEMA KEYS
     properties = req.schema.get("properties", {})
     final = {}
 
