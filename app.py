@@ -57,7 +57,9 @@ Rules:
 - due_in_days integer
 - is_paid boolean
 - priority one of low, normal, high, urgent
-- contact_email lowercase
+- contact_email must always be extracted if an email exists.
+- Convert it to lowercase.
+- Do not return null if an email is present.
 - preserve line_items order
 - unit_price integer
 - item_count = len(line_items)
@@ -91,6 +93,18 @@ Invoice:
         text = response.choices[0].message.content
 
         data = json.loads(text)
+        
+
+        if data.get("contact_email") is None:
+
+           match = re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            req.text 
+           )
+
+           if match:
+             data["contact_email"] = match.group(0).lower()
+        
 
         # ---------------- Normalize ----------------
 
