@@ -24,17 +24,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class InvoiceRequest(BaseModel):
     document_id: str
     text: str
     schema: dict
 
-
 @app.get("/")
 def home():
     return {"status": "running"}
-
 
 @app.post("/")
 @app.post("/extract")
@@ -83,23 +80,18 @@ def extract_invoice(req: InvoiceRequest):
     elif "net 60" in text_lower:
         fallback_due_days = 60
 
-    # --- Fallback: invoice_date (The fix for your exact error) ---
+    # --- Fallback: invoice_date ---
     fallback_invoice_date = None
-    
-    # Check for YYYY-MM-DD or YYYY/MM/DD
     iso_match = re.search(r"\b(\d{4})[-\/](\d{2})[-\/](\d{2})\b", req.text)
     if iso_match:
         fallback_invoice_date = f"{iso_match.group(1)}-{iso_match.group(2)}-{iso_match.group(3)}"
     
-    # Check for DD-MM-YYYY or MM-DD-YYYY digits
     if not fallback_invoice_date:
         dmy_match = re.search(r"\b(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})\b", req.text)
         if dmy_match:
             g1, g2, g3 = dmy_match.group(1).zfill(2), dmy_match.group(2).zfill(2), dmy_match.group(3)
-            # Default convert to YYYY-MM-DD format
             fallback_invoice_date = f"{g3}-{g2}-{g1}"
 
-    # Check for textual variants (e.g., "22 September 2024" or "Sep 22, 2024")
     if not fallback_invoice_date:
         months_regex = r"(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
         text_dmy = re.search(rf"\b(\d{{1,2}})\s+{months_regex}\s+(\d{{4}})\b", req.text, re.IGNORECASE)
@@ -116,6 +108,12 @@ def extract_invoice(req: InvoiceRequest):
         elif text_mdy:
             fallback_invoice_date = f"{text_mdy.group(3)}-{months_map[text_mdy.group(1).lower()]}-{text_mdy.group(2).zfill(2)}"
 
+    # --- Fallback: is_paid ---
+    fallback_is_paid = None
+    if any(x in text_lower for x in ["paid in full", "status: paid", "amount due: 0", "balance due: 00", "settled"]):
+        fallback_is_paid = True
+    elif any(x in text_lower for x in ["awaiting payment", "due by", "unpaid", "balance due", "please pay"]):
+        fallback_is_paid = False
 
     # 2. CALL THE LLM WITH JSON SCHEMA ENFORCEMENT
     try:
@@ -138,7 +136,8 @@ def extract_invoice(req: InvoiceRequest):
                         "You are a precise data extraction engine. You must strictly match the types "
                         "requested in the schema. Convert text descriptions of time periods or values "
                         "into clean integers (e.g., 'within a week' -> 7, 'in two weeks' -> 14, "
-                        "'Net 30' -> 30, 'twelve thousand' -> 12000). Always normalize invoice_date to YYYY-MM-DD."
+                        "Net 30' -> 30, 'twelve thousand' -> 12000). Always normalize invoice_date to YYYY-MM-DD. "
+                        "Infer is_paid accurately as a boolean."
                     )
                 },
                 {
@@ -148,8 +147,8 @@ def extract_invoice(req: InvoiceRequest):
             ],
         )
 
-        text = response.choices[0].message.content
-        data = json.loads(text)
+        text_res = response.choices[0].message.content
+        data = json.loads(text_res)
 
     except Exception as e:
         print(f"Extraction processing failed: {e}")
@@ -165,16 +164,19 @@ def extract_invoice(req: InvoiceRequest):
     if data.get("due_in_days") is None and fallback_due_days is not None:
         data["due_in_days"] = fallback_due_days
 
-    # Apply the Python fallback if the LLM returned null or bad value for invoice_date
     if (not data.get("invoice_date") or data.get("invoice_date") == "null") and fallback_invoice_date:
         data["invoice_date"] = fallback_invoice_date
 
+    # --- The Fix for is_paid ---
+    if data.get("is_paid") is None:
+        if fallback_is_paid is not None:
+            data["is_paid"] = fallback_is_paid
+        else:
+            data["is_paid"] = False # Safe default fallback instead of returning null
+
+    # Final type casting safety checks
     if isinstance(data.get("vendor"), str):
-        data["vendor"] = re.sub(
-            r"[.,:;!?]+$",
-            "",
-            data["vendor"].strip()
-        )
+        data["vendor"] = re.sub(r"[.,:;!?]+$", "", data["vendor"].strip())
 
     if isinstance(data.get("contact_email"), str):
         data["contact_email"] = data["contact_email"].strip().lower()
@@ -185,7 +187,6 @@ def extract_invoice(req: InvoiceRequest):
     if isinstance(data.get("priority"), str):
         data["priority"] = data["priority"].strip().lower()
 
-    # Verify key numeric metrics are explicitly converted to base integers
     for int_field in ["total_amount", "due_in_days"]:
         if data.get(int_field) is not None:
             try:
@@ -197,14 +198,12 @@ def extract_invoice(req: InvoiceRequest):
         for item in data["line_items"]:
             if not isinstance(item, dict):
                 continue
-
             for nested_int in ["quantity", "unit_price"]:
                 if item.get(nested_int) is not None:
                     try:
                         item[nested_int] = int(float(item[nested_int]))
                     except Exception:
                         pass
-
         data["item_count"] = len(data["line_items"])
     else:
         data["item_count"] = 0
@@ -214,6 +213,10 @@ def extract_invoice(req: InvoiceRequest):
     final = {}
 
     for key in properties:
-        final[key] = data.get(key, None)
+        # If the key is is_paid and it's missing or resolves to None, explicitly lock it to False
+        if key == "is_paid" and (data.get(key) is None or data.get(key) == "null"):
+            final[key] = False
+        else:
+            final[key] = data.get(key, None)
 
     return final
