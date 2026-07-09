@@ -40,6 +40,8 @@ def home():
 def extract_invoice(req: InvoiceRequest):
 
     # 1. BULLETPROOF FALLBACK EXTRACTIONS (Python Safety Net)
+    
+    # --- Fallback: Email ---
     fallback_email = None
     email_match = re.search(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
@@ -48,6 +50,7 @@ def extract_invoice(req: InvoiceRequest):
     if email_match:
         fallback_email = email_match.group(0).strip().lower()
 
+    # --- Fallback: Currency ---
     fallback_currency = None
     text_upper = req.text.upper()
     if any(x in text_upper for x in ["EUR", "EURO", "€"]): 
@@ -61,14 +64,32 @@ def extract_invoice(req: InvoiceRequest):
     elif any(x in text_upper for x in ["JPY", "YEN", "¥"]): 
         fallback_currency = "JPY"
 
-    # 2. CALL THE LLM WITH STRICT JSON SCHEMA ENFORCEMENT
+    # --- Fallback: due_in_days (The fix for your exact error) ---
+    fallback_due_days = None
+    text_lower = req.text.lower()
+    
+    # Catch structural expressions or raw digits associated with terms of payment
+    digit_days_match = re.search(r"(?:net|within|due\s+in|\bpay\b[^.!?]*?\bwithin\b)\s*(\d+)\s*day", text_lower)
+    if digit_days_match:
+        fallback_due_days = int(digit_days_match.group(1))
+    elif "within a week" in text_lower or "due in a week" in text_lower or "payable within a week" in text_lower:
+        fallback_due_days = 7
+    elif "two weeks" in text_lower or "within two weeks" in text_lower or "due in two weeks" in text_lower:
+        fallback_due_days = 14
+    elif "net 30" in text_lower:
+        fallback_due_days = 30
+    elif "net 45" in text_lower:
+        fallback_due_days = 45
+    elif "net 60" in text_lower:
+        fallback_due_days = 60
+
+
+    # 2. CALL THE LLM WITH JSON SCHEMA ENFORCEMENT
     try:
         response = client.chat.completions.create(
             model="google/gemini-2.5-flash",
             temperature=0,
             max_tokens=1500, 
-            # Submitting the dynamic schema via strict format handling 
-            # prevents the model from dropping fields or leaving them as null.
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -107,6 +128,10 @@ def extract_invoice(req: InvoiceRequest):
 
     if not data.get("currency") and fallback_currency:
         data["currency"] = fallback_currency
+
+    # Apply the Python fallback if the LLM returned null/omitted due_in_days
+    if data.get("due_in_days") is None and fallback_due_days is not None:
+        data["due_in_days"] = fallback_due_days
 
     if isinstance(data.get("vendor"), str):
         data["vendor"] = re.sub(
