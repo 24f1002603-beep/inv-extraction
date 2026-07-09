@@ -41,8 +41,7 @@ def home():
 @app.post("/extract")
 def extract_invoice(req: InvoiceRequest):
 
-    # 1. BULLETPROOF EMAIL EXTRACTION (Python Backup)
-    # Find any email directly in the text first, so we always have it as a safety net
+    # 1. BULLETPROOF FALLBACK EXTRACTIONS (Python Safety Net)
     fallback_email = None
     email_match = re.search(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
@@ -51,20 +50,34 @@ def extract_invoice(req: InvoiceRequest):
     if email_match:
         fallback_email = email_match.group(0).strip().lower()
 
+    # Pre-scan for common currencies in the text as a backup
+    fallback_currency = None
+    text_upper = req.text.upper()
+    if "EUR" in text_upper or "EURO" in text_upper or "€" in text_upper:
+        fallback_currency = "EUR"
+    elif "USD" in text_upper or "DOLLAR" in text_upper or "$" in text_upper:
+        fallback_currency = "USD"
+    elif "GBP" in text_upper or "POUND" in text_upper or "£" in text_upper:
+        fallback_currency = "GBP"
+    elif "INR" in text_upper or "RUPEE" in text_upper or "₹" in text_upper:
+        fallback_currency = "INR"
+    elif "JPY" in text_upper or "YEN" in text_upper or "¥" in text_upper:
+        fallback_currency = "JPY"
+
     prompt = f"""
 Extract the invoice into JSON.
 
-Return ONLY valid JSON matching the supplied schema. No markdown wrapping.
+Return ONLY valid JSON matching the supplied schema. Do not use markdown wrappers like ```json.
 
 Rules:
 - vendor exactly as written (remove trailing punctuation only)
-- currency must be ISO4217
+- currency must be ISO4217 code (USD, EUR, GBP, INR, JPY)
 - total_amount integer
 - invoice_date YYYY-MM-DD
 - due_in_days integer
 - is_paid boolean
 - priority one of low, normal, high, urgent
-- contact_email must be extracted in lowercase.
+- contact_email must be extracted in lowercase
 - preserve line_items order
 - unit_price integer
 - item_count = len(line_items)
@@ -77,11 +90,11 @@ Invoice:
 """
 
     try:
-        # Using a highly deterministic, accurate model for schema-following
+        # Switching to a production-grade model (Gemini 2.5 Flash) for highly accurate schema following
         response = client.chat.completions.create(
-            model="meta-llama/llama-3.1-8b-instruct:free",
+            model="google/gemini-2.5-flash",
             temperature=0,
-            max_tokens=1000,  # High token limit ensures long lists of line items do not cut off
+            max_tokens=1500, 
             response_format={"type": "json_object"},
             messages=[
                 {
@@ -99,16 +112,17 @@ Invoice:
         data = json.loads(text)
 
     except Exception as e:
-        print(f"JSON Parsing failed: {e}")
-        # If the AI broke the JSON format completely, start with an empty dictionary 
-        # so our normalization steps can still try to fill out what they can
+        print(f"Extraction processing failed: {e}")
         data = {}
 
     # ---------------- Normalize & Force Corrections ----------------
 
-    # Force email fix if the AI omitted it, left it blank, or crashed
+    # Apply backup safety net fields if the AI missed them or crashed
     if not data.get("contact_email") and fallback_email:
         data["contact_email"] = fallback_email
+
+    if not data.get("currency") and fallback_currency:
+        data["currency"] = fallback_currency
 
     if isinstance(data.get("vendor"), str):
         data["vendor"] = re.sub(
@@ -157,7 +171,6 @@ Invoice:
 
         data["item_count"] = len(data["line_items"])
     else:
-        # Ensure it has a value if the grader checks it
         data["item_count"] = 0
 
     # -------- Return EXACTLY schema keys --------
@@ -165,7 +178,6 @@ Invoice:
     final = {}
 
     for key in properties:
-        # Fallback to None if a property completely failed to extract
         final[key] = data.get(key, None)
 
     return final
