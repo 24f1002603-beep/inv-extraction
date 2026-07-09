@@ -42,46 +42,38 @@ def home():
 def extract_invoice(req: InvoiceRequest):
 
     prompt = f"""
-Extract the invoice into JSON.
-
-Return ONLY valid JSON.
-
-Return EXACTLY the supplied JSON schema.
+Extract the invoice details into a flat JSON object matching the exact schema provided below.
 
 Rules:
-
-- vendor exactly as written (remove trailing punctuation only)
-- currency must be ISO4217
-- total_amount integer
-- invoice_date YYYY-MM-DD
-- due_in_days integer
-- is_paid boolean
-- priority one of low, normal, high, urgent
-- contact_email must always be extracted if an email exists.
-- Convert it to lowercase.
-- Do not return null if an email is present.
-- preserve line_items order
-- unit_price integer
-- item_count = len(line_items)
+- vendor: exact proper name as written (strip trailing punctuation).
+- currency: valid 3-letter ISO 4217 code (e.g., USD, EUR, INR).
+- total_amount: integer only. Convert words, text scales like K/M, and strip punctuation.
+- invoice_date: format strictly as YYYY-MM-DD.
+- due_in_days: integer count of days from the invoice date.
+- is_paid: boolean.
+- priority: exactly one of: low, normal, high, urgent.
+- contact_email: lowercase email address.
+- line_items: array of objects containing exactly {{sku, quantity, unit_price}}. Keep original order.
+- item_count: integer count matching the length of line_items.
 
 Schema:
 {json.dumps(req.schema)}
 
-Invoice:
+Invoice Text:
 {req.text}
 """
 
     try:
-
+        # Using a highly accurate model for structured data tasks
         response = client.chat.completions.create(
-            model="tencent/hy3:free",
+            model="meta-llama/llama-3.1-8b-instruct:free",
             temperature=0,
-            max_tokens=250,
+            max_tokens=1000,  # Bumped up so long line-items don't truncate the JSON
             response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
-                    "content": "Return ONLY valid JSON matching the supplied schema. Never include markdown, explanations or extra text."
+                    "content": "You are a precise data extraction API. Return ONLY raw JSON matching the requested schema. No markdown formatting, no code blocks, no trailing conversational text."
                 },
                 {
                     "role": "user",
@@ -91,22 +83,18 @@ Invoice:
         )
 
         text = response.choices[0].message.content
-
         data = json.loads(text)
-        
 
-        if data.get("contact_email") is None:
+        # Fix: Catch both missing keys AND empty strings
+        if not data.get("contact_email"):
+            match = re.search(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                req.text 
+            )
+            if match:
+                data["contact_email"] = match.group(0).lower()
 
-           match = re.search(
-            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-            req.text 
-           )
-
-           if match:
-             data["contact_email"] = match.group(0).lower()
-        
-
-        # ---------------- Normalize ----------------
+        # ---------------- Normalization & Type Safety ----------------
 
         if isinstance(data.get("vendor"), str):
             data["vendor"] = re.sub(
@@ -116,25 +104,13 @@ Invoice:
             )
 
         if isinstance(data.get("contact_email"), str):
-            data["contact_email"] = (
-                data["contact_email"]
-                .strip()
-                .lower()
-            )
+            data["contact_email"] = data["contact_email"].strip().lower()
 
         if isinstance(data.get("currency"), str):
-            data["currency"] = (
-                data["currency"]
-                .strip()
-                .upper()
-            )
+            data["currency"] = data["currency"].strip().upper()
 
         if isinstance(data.get("priority"), str):
-            data["priority"] = (
-                data["priority"]
-                .strip()
-                .lower()
-            )
+            data["priority"] = data["priority"].strip().lower()
 
         if data.get("total_amount") is not None:
             try:
@@ -149,44 +125,31 @@ Invoice:
                 pass
 
         if isinstance(data.get("line_items"), list):
-
             for item in data["line_items"]:
-
                 if not isinstance(item, dict):
                     continue
-
                 if item.get("quantity") is not None:
                     try:
                         item["quantity"] = int(float(item["quantity"]))
                     except Exception:
                         pass
-
                 if item.get("unit_price") is not None:
                     try:
                         item["unit_price"] = int(float(item["unit_price"]))
                     except Exception:
                         pass
-
+            
             data["item_count"] = len(data["line_items"])
 
-        # -------- Return EXACTLY schema keys --------
-
+        # -------- Ensure exact keys from schema are returned --------
         properties = req.schema.get("properties", {})
-
         final = {}
-
         for key in properties:
             final[key] = data.get(key)
 
         return final
 
     except Exception as e:
-
-        print(e)
-
+        print(f"Extraction Error: {e}")
         properties = req.schema.get("properties", {})
-
-        return {
-            key: None
-            for key in properties
-        }
+        return {key: None for key in properties}
